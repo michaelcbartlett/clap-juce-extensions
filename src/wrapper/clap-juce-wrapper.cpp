@@ -416,6 +416,13 @@ class ClapJuceWrapper : public clap::helpers::Plugin<
     bool usingLegacyParameterAPI{false};
     std::atomic<bool> callLatencyChangeOnNextActivate{false};
 
+    // True only while we are inside activate() running the processor's prepareToPlay().
+    // A latency change reported during that window must NOT trigger host->requestRestart()
+    // (see audioProcessorChanged): the host queries latencyGet() right after activate()
+    // returns, and a pending restart handshake blocks Bitwig 6's offline bounce when
+    // prepareToPlay rescales latency for a non-48k sample rate.
+    bool inPrepareToPlayDuringActivate{false};
+
     ClapJuceWrapper(const clap_host *host, juce::AudioProcessor *p)
         : clap::helpers::Plugin<clap::helpers::MisbehaviourHandler::CLAP_MISBEHAVIOUR_HANDLER_LEVEL,
                                 clap::helpers::CheckingLevel::CLAP_CHECKING_LEVEL>(&desc, host),
@@ -633,16 +640,25 @@ class ClapJuceWrapper : public clap::helpers::Plugin<
         juce::ignoreUnused(proc);
         if (details.latencyChanged)
         {
-            runOnMainThread([this] {
-                if (isBeingDestroyed())
-                    return;
+            // A latency change reported from inside the plugin's own activate()/prepareToPlay
+            // needs no restart: the host queries latencyGet() immediately after activate()
+            // returns, so it already observes the final value. Requesting a restart here also
+            // breaks Bitwig 6's offline bounce, which refuses to start while a restart
+            // handshake is pending (e.g. when prepareToPlay rescales latency for a non-48k
+            // rate). Only request a restart for latency changes while already active.
+            if (!inPrepareToPlayDuringActivate)
+            {
+                runOnMainThread([this] {
+                    if (isBeingDestroyed())
+                        return;
 
-                if (_host.canUseLatency())
-                {
-                    callLatencyChangeOnNextActivate = true;
-                    _host.requestRestart();
-                }
-            });
+                    if (_host.canUseLatency())
+                    {
+                        callLatencyChangeOnNextActivate = true;
+                        _host.requestRestart();
+                    }
+                });
+            }
         }
         if (details.programChanged)
         {
@@ -916,7 +932,9 @@ class ClapJuceWrapper : public clap::helpers::Plugin<
         }
 
         processor->setRateAndBufferSizeDetails(sampleRate, (int)maxFrameCount);
+        inPrepareToPlayDuringActivate = true;
         processor->prepareToPlay(sampleRate, (int)maxFrameCount);
+        inPrepareToPlayDuringActivate = false;
         midiBuffer.ensureSize(2048);
         midiBuffer.clear();
 
