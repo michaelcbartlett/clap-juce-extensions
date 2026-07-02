@@ -416,6 +416,14 @@ class ClapJuceWrapper : public clap::helpers::Plugin<
     bool usingLegacyParameterAPI{false};
     std::atomic<bool> callLatencyChangeOnNextActivate{false};
 
+    // A latency change reported *during* activate()'s own prepareToPlay() call is already
+    // reflected in the value the host reads via latency.get() right after activate() returns,
+    // so requesting a restart for it is both unnecessary and actively harmful: Bitwig 6 will not
+    // start a CLAP offline bounce while that restart handshake is pending, so the export silently
+    // does nothing. Suppress the restart request only for this window; a latency change while
+    // already active still requests a restart normally.
+    bool inPrepareToPlayDuringActivate{false};
+
     ClapJuceWrapper(const clap_host *host, juce::AudioProcessor *p)
         : clap::helpers::Plugin<clap::helpers::MisbehaviourHandler::CLAP_MISBEHAVIOUR_HANDLER_LEVEL,
                                 clap::helpers::CheckingLevel::CLAP_CHECKING_LEVEL>(&desc, host),
@@ -631,7 +639,7 @@ class ClapJuceWrapper : public clap::helpers::Plugin<
     void audioProcessorChanged(juce::AudioProcessor *proc, const ChangeDetails &details) override
     {
         juce::ignoreUnused(proc);
-        if (details.latencyChanged)
+        if (details.latencyChanged && !inPrepareToPlayDuringActivate)
         {
             runOnMainThread([this] {
                 if (isBeingDestroyed())
@@ -916,7 +924,9 @@ class ClapJuceWrapper : public clap::helpers::Plugin<
         }
 
         processor->setRateAndBufferSizeDetails(sampleRate, (int)maxFrameCount);
+        inPrepareToPlayDuringActivate = true;
         processor->prepareToPlay(sampleRate, (int)maxFrameCount);
+        inPrepareToPlayDuringActivate = false;
         midiBuffer.ensureSize(2048);
         midiBuffer.clear();
 
